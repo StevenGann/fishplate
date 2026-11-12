@@ -1,11 +1,11 @@
 # Fishplate
 
 **Design document**
-Version 0.2 · 2026-11-12 · pre-implementation. Nothing here is built yet.
+Version 0.3 · 2026-11-12 · pre-implementation. Nothing here is built yet.
 
-An implementer should read 8 to 16 as normative, 22 as the order of work, and 25 as the tests that
-must pass before any of it means anything. Sections 1 to 7 explain the reasoning and can be read
-later.
+Every provider behaviour below links to the vendor documentation it came from. Where a statement is
+this document's own inference rather than documented behaviour, the text says so, and section 25
+lists the assumptions that would break the design if they turn out to be wrong.
 
 Fishplate keeps one record per bug across Asana, GitHub and Slack. Each field has exactly one owning
 system; Fishplate writes that value into the others and records who changed what. It runs as one
@@ -18,12 +18,16 @@ The name is the plate bolted across a rail joint. The seam stays; the traffic do
 
 ## 1. The problem
 
-The first deployment is at a hardware company that runs Asana company-wide and GitHub for code,
-across many repositories. Access is granted per person, so most engineers can open a handful of
-repositories.
+A company runs Asana company-wide and GitHub for code across many repositories, with access granted
+per person. Most engineers can open a handful of repositories.
 
-GitHub ties issue visibility to repository permission, and projects do not change that. GitHub's own
-documentation says only people with access to a private repository can view project items from it.
+GitHub ties issue visibility to repository permission, and projects do not change that:
+
+> Only people with access to a private repository will be able to view project items from that
+> private repository.
+>
+> Source: [Managing visibility of your projects](https://docs.github.com/en/issues/planning-and-tracking-with-projects/managing-your-project/managing-visibility-of-your-projects)
+
 An issue in a repository someone cannot open is invisible to them, whatever board it appears on.
 
 Bug reports that are not about code have no natural home in a repository either: hardware failures,
@@ -47,8 +51,8 @@ What it does not do, with the reason attached:
   the link and the canonical copy, not a queue.
 - **Mirror both ways.** Two-way mirrors oscillate. Section 10 describes the one-way projection and
   the guards that keep it stable.
-- **Serve several companies from one deployment.** Single tenant, one install per company. A shared
-  deployment would need a tenancy model this design does not have.
+- **Serve several companies from one deployment.** Single tenant; a shared deployment would need a
+  tenancy model this design does not have.
 - **Store files.** Attachments stay where they were uploaded and are referenced by link.
 
 ## 3. Scope
@@ -67,13 +71,11 @@ What it does not do, with the reason attached:
 
 - Webhook intake for all three providers (v0.2). The polling path stays supported forever.
 - Mutating MCP tools (v0.3).
-- Duplicate suggestions, severity roll-ups, per-team routing, Slack thread mirroring, board views,
-  saved dashboards.
+- Duplicate suggestions, severity roll-ups, per-team routing, Slack thread mirroring, board views.
 
 ## 4. Design targets
 
-These exist so that "good enough" has a number to check against. They are targets for the reference
-deployment, not limits of the design.
+Targets for the reference deployment, not limits of the design.
 
 | Dimension | Target |
 |---|---|
@@ -85,6 +87,9 @@ deployment, not limits of the design.
 | Dashboard search | p95 under 300 ms at 10,000 bugs |
 | Footprint | 1 vCPU, 512 MiB RSS typical, 2 GiB limit |
 | Recovery | rebuild links from providers in under 30 minutes at 10,000 bugs |
+
+The rate limits in section 13 are the binding constraint on most of these, which is why section 16
+gives the reconciler an explicit request budget rather than a timer.
 
 ## 5. Vocabulary
 
@@ -188,9 +193,10 @@ outbox table with `status`, `attempts` and `next_attempt_at` gives durability, b
 interface. If a deployment outgrows it, the outbox interface moves to a real queue without touching
 the engine.
 
-The scheduler is deliberately simple: one polling goroutine per connector, a worker pool of four for
-outbox delivery, and a reconciler that runs every fifteen minutes and re-reads the owning system for
-every open bug. The reconciler is the safety net for a missed webhook and is not optional.
+**Scheduling.** One polling goroutine per connector, a delivery worker per provider (not a shared
+pool; see the pacing rule in section 13.1), and a reconciler. The reconciler is budgeted, not
+timed: it may spend at most 40% of each provider's request allowance, and it works through bugs in
+`last_seen_at` order so a bug that has just been checked is not checked again before a stale one.
 
 ## 8. Data model
 
@@ -272,10 +278,9 @@ Invariants the store enforces rather than documents:
 - `BUGS.version` increments on every applied change. Writers pass the version they read; a mismatch
   re-reads instead of overwriting.
 - `field_owner` is copied onto the bug at creation and travels with it. Changing the config does not
-  retroactively change who owns an existing bug's field, which would rewrite history under people's
-  feet.
-- `OUTBOX` rows are never deleted before their result is recorded. Completed rows are pruned after 30
-  days.
+  retroactively change who owns an existing bug's field.
+- `OUTBOX` rows are never deleted before their result is recorded. Completed rows are pruned after
+  30 days.
 
 Retention: events 90 days, outbox 30 days, conflicts 12 months, audit 24 months. A nightly job does
 the pruning and records what it removed.
@@ -307,26 +312,30 @@ Rules enforced in one function, used by every writer including the dashboard and
 - `wontfix` requires a reason of at least ten characters.
 - `duplicate` requires `duplicate_of`, which must be an existing bug id and not itself.
 - `closed` is reachable only from `verified`, `wontfix` or `duplicate`.
-- Reopening a closed bug returns it to `triaged`, never to `in_progress`, because triage decides
-  whether the original fix was wrong or the report was wrong.
+- Reopening a closed bug returns it to `triaged`, because triage decides whether the original fix was
+  wrong or the report was wrong.
 - A transition that is not in the diagram is rejected with the list of allowed next states.
 
-Provider mapping. The canonical state is derived from the fix system; the other system is projected
-to match.
+### 9.1 Provider mapping
+
+GitHub issues carry both `state` and `state_reason`. The
+[update an issue endpoint](https://docs.github.com/en/rest/issues/issues#update-an-issue) accepts
+`state_reason` values `completed`, `not_planned`, `duplicate` and `reopened`, and accepts
+`duplicate_issue_id` when the reason is `duplicate`. That covers every canonical terminal state
+without a label convention, which an earlier draft of this document got wrong.
 
 | Canonical | GitHub | Asana |
 |---|---|---|
 | `new` | open, no `triaged` label | task in New |
 | `triaged` | `triaged` label | task in Triage |
 | `in_progress` | `in progress` label, or an open linked PR | task in Doing |
-| `fixed` | closed as completed, or linked PR merged | task in Done, `fixed` custom field |
+| `fixed` | closed, `state_reason=completed` | task in Done, `fixed` custom field |
 | `verified` | `verified` label | task in Verified |
-| `wontfix` | closed as not planned, `wontfix` label | task completed, `resolution=wontfix` |
-| `duplicate` | closed as not planned, `duplicate` label | task completed, `resolution=duplicate` |
+| `wontfix` | closed, `state_reason=not_planned` | task completed, `resolution=wontfix` |
+| `duplicate` | closed, `state_reason=duplicate`, `duplicate_issue_id` set | task completed, `resolution=duplicate` |
 
-GitHub cannot express `wontfix` and `duplicate` separately, so the label carries the distinction and
-the label is part of the state definition, not decoration. Reading state back requires labels on
-every list call; the connector requests them explicitly.
+`state_reason=reopened` maps to `triaged`. Reading state back requires the labels on every list
+call, so the connector requests them explicitly rather than relying on defaults.
 
 ## 10. Applying a change
 
@@ -380,8 +389,9 @@ Three checks, each covering a different failure:
 
 1. **Origin marker.** Comments and descriptions carry a marker with the outbox row id:
    `<!-- fishplate:origin=7c2f… -->` for GitHub, an appended `[fishplate:7c2f…]` line for Asana
-   stories, and a metadata field on Slack messages. An inbound change containing a known id is
-   suppressed.
+   stories, and Slack message [metadata](https://docs.slack.dev/messaging/message-metadata/) with
+   `event_type` `fishplate_origin` and the row id in `event_payload`. An inbound change containing a
+   known id is suppressed.
 2. **Applied hash.** After a projection, store `sha256` of the normalized fields written for that
    `(bug, system)`. An inbound change whose resulting normalized state hashes to the same value
    produces no projection. This is the guard that survives a provider stripping the marker.
@@ -389,10 +399,9 @@ Three checks, each covering a different failure:
    re-evaluated, not applied.
 
 A fourth failure is not covered by any of those: the process dies between sending a write and
-recording its result. Providers here have no idempotency key, so the retry may duplicate. The outbox
-worker handles it by reading the object back before retrying. If the external object already matches
-what was sent, the row is marked done; if it does not, the write is repeated. Section 16 covers the
-rest of the failure cases.
+recording its result. None of these providers offers an idempotency key, so a retry may duplicate.
+The outbox worker reads the object back before retrying. If the external object already matches what
+was sent, the row is marked done; if it does not, the write is repeated.
 
 ### 10.3 Ordering
 
@@ -407,24 +416,62 @@ For scalar fields the owner wins and the other side is told. There is no merge a
 wins between two systems. Comments and labels are additive, so both sides may contribute; labels
 whose prefix belongs to a system are still written only by that system.
 
+Conflict comments are deduplicated per `(bug, field, source)` for one hour. Without that, someone who
+edits a title five times in the wrong tracker produces five identical notes and turns the feature
+into spam.
+
 Ownership can be changed deliberately with `fishplate bug set-owner <id> <field> <system>`, which
 writes an audit row and is available to admins in the dashboard. Teams reorganise, and the
 alternative to a supported takeover is people disabling the bridge.
+
+### 10.5 Where this design is weakest
+
+Written down because a design that cannot name its weak points has not been tested.
+
+- **Field ownership is rigid, and rigidity is the point.** A team that edits both copies will see
+  conflict notes and may conclude the bridge is broken. The mitigation is the description banner and
+  a takeover command, not a softer rule. If the company will not accept one-owner-per-field, the
+  correct answer is not this product.
+- **Free-text bodies drift.** Title and description are owned by the intake system, so an edit made
+  elsewhere is rejected. That is defensible for a bug report and irritating for a living description.
+  A future version could mirror body edits as appended notes instead of refusing them.
+- **A third place to look.** The dashboard can become a habit, which partly defeats the goal of
+  leaving people in their tools. The design keeps the dashboard read-mostly in practice by offering
+  no queue, no inbox workflow and no notifications of its own.
+- **Polling is the opposite of what GitHub recommends.** Their
+  [best practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)
+  open with "avoid polling" and recommend webhooks. This design accepts the recommendation and
+  violates it deliberately, because an install behind NAT cannot receive webhooks at all, and a
+  product that only works with a public endpoint is not deployable where this one starts. Webhooks
+  become the fast path in v0.2 without removing polling.
+- **Identity mapping is the likeliest thing to break in year two.** Handles change, people leave,
+  and provider email visibility differs. Section 11 treats it as a product surface rather than a
+  migration.
 
 ## 11. People
 
 | Column | Source |
 |---|---|
-| `email` | canonical key, lowercased |
+| `email` | canonical join key, lowercased |
 | `github_id` | numeric id, stable across renames |
-| `github_login` | for display and for admin lists |
+| `github_login` | display and admin lists |
 | `asana_gid` | Asana user gid |
 | `slack_uid` | Slack user id |
 
 Resolution order: exact email, then a provider id match, then the alias table in config, then
 `unmapped`. Unmapped is a real state, not an error: the bug keeps the provider's display name, the
-dashboard shows it as unmapped, and `fishplate people unmapped` lists who needs fixing. Silently
-dropping an assignee because of an org-chart mismatch is the failure mode that erodes trust first.
+dashboard shows it as unmapped, and `fishplate people unmapped` lists who needs fixing.
+
+**GitHub email is the hard part.** A user whose email is private does not expose it through the
+public user object, so an email join built only from API reads will fail for exactly the people who
+care about privacy. The design gets the address from the person themselves: at dashboard login, the
+user-to-server token calls `GET /user/emails`, which is available to an app holding the
+[Email addresses permission](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps),
+and the verified primary address is written to the map. Accounts that never log in stay unmapped
+until an admin resolves them. That is a deliberate trade: no silent guessing from a noreply address.
+
+Slack needs `users:read.email` in addition to `users:read` to return addresses from `users.list`;
+without it, the Slack column of the map fills from logins only.
 
 Matching keys on numeric ids matters. GitHub logins and Asana emails both change.
 
@@ -444,9 +491,9 @@ defaults:
 people:
   match: email
   overrides:
-    - email: "sam@example.com"
+    - email: "<work address, exactly as it appears in Asana>"
       github: sam-example
-      asana: "1200000000000001"
+      asana: "[REDACTED]"
 
 connectors:
   github:
@@ -455,8 +502,8 @@ connectors:
     repos: ["acme/firmware", "acme/tools"]
     poll_interval: 60s
   asana:
-    workspace: "1200000000000000"
-    project: "1200000000000002"
+    workspace: "[REDACTED]"
+    project: "[REDACTED]"
     poll_interval: 60s
   slack:
     channel: "C0123456789"
@@ -468,7 +515,7 @@ rules:
       source: asana
       event: task.added
       match:
-        project: "1200000000000002"
+        project: "[REDACTED]"
         section: "New"
     do:
       - bug.create:
@@ -498,90 +545,131 @@ Semantics the implementation must hold to:
 
 - `when.match` is exact match on normalized values; an absent key means any.
 - Templates support path lookup and a `default` filter only. The context is `bug`, `task`, `issue`,
-  `result` and `actor`. No expressions, no function calls.
+  `result` and `actor`.
 - `bug.create` comes first; a `do` list that writes to a system without a link is rejected at
   validation time unless the write is the one that creates the link.
 - Each rule names one intake event, so a bug has one intake system. Two rules creating a bug for the
-  same provider object is a configuration error the validator catches by constructing a rule table
-  and checking for overlapping intake matchers.
+  same provider object is a configuration error the validator catches by building a rule table and
+  checking for overlapping intake matchers.
 - Rule evaluation is deterministic and ordered. Two rules that could both fire on the same event are
   rejected.
 
 ## 13. Connectors
 
 **First run.** Every connector supports a full crawl that pages the entire configured scope and
-stores bugs and links, before any cursor exists. GitHub walks `GET /repos/{owner}/{repo}/issues` page
-by page from the oldest open item; Asana walks the project's tasks. The crawl is resumable, records
-its position, and finishes before the incremental path starts. Without this step a fresh install
-shows an empty dashboard, and the first incremental poll would silently miss every pre-existing bug.
+stores bugs and links before any cursor exists. The crawl is resumable, records its position, and
+finishes before the incremental path starts. Without it a fresh install shows an empty dashboard and
+the first incremental poll misses every pre-existing bug.
+
+**Back-references make rebuild possible.** Every projection writes a pointer to the other system into
+the provider object: the canonical bug UUID and the GitHub URL in an Asana task note, and a
+`fishplate:bug=<uuid>` marker in the GitHub issue body. Without a back-reference, `rebuild` can only
+recover links the database already knew, which is not a rebuild. With one, an operator can
+reconstruct the table from the providers after losing the database, and the 30-minute recovery
+target in section 4 becomes achievable.
 
 ### 13.1 GitHub
 
-- **Auth:** a GitHub App, not a personal token. Installation token for server-to-server calls, with
-  `issues: write`, `metadata: read`, `pull_requests: read`.
+- **Auth:** a GitHub App, not a personal token. Installation tokens for server-to-server calls, with
+  `issues: write`, `metadata: read`, `pull_requests: read`. The
+  [permissions reference](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps)
+  lists the endpoints each permission unlocks.
 - **Read:** `GET /repos/{owner}/{repo}/issues?state=all&since=…` with the stored `ETag` in
-  `If-None-Match`. A 304 does not consume rate limit, which is what makes minute polling affordable.
-- **Write:** create, update and close issues; create comments. Requests are made with the
-  installation token and carry the origin marker in the comment body.
-- **Webhooks (v0.2):** `issues`, `issue_comment`, `pull_request`. Verify `X-Hub-Signature-256` over
-  the raw body, deduplicate on `X-GitHub-Delivery`. Redeliveries keep the same id, so the unique
-  index does the work.
-- **Rate limit:** 5,000 requests per hour per installation. Honour `Retry-After` on 403 and stop
-  when `x-ratelimit-remaining` reaches zero.
-- **Trap:** pull requests appear in the issues API. Anything with a `pull_request` field must be
+  `If-None-Match`. `since` returns items last updated after the timestamp
+  ([issues endpoint](https://docs.github.com/en/rest/issues/issues)). Conditional requests that
+  return `304 Not Modified` do not count against the primary limit when the request is authenticated
+  ([best practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)).
+  Respect `x-poll-interval` when GitHub sends it.
+- **Write:** create, update and close issues, create comments. Closing with a reason uses
+  `state_reason`, and a duplicate sets `duplicate_issue_id`.
+- **Webhooks (v0.2):** `issues`, `issue_comment`, `pull_request`. Validate `X-Hub-Signature-256`,
+  a SHA-256 HMAC of the raw body, before parsing
+  ([validating webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)).
+  Deduplicate on `X-GitHub-Delivery`; redeliveries carry the same id.
+- **Rate limit:** an installation token gets a minimum of 5,000 requests per hour, plus 50 per
+  repository above 20 and 50 per organization user above 20, capped at 12,500; 15,000 on GitHub
+  Enterprise Cloud
+  ([rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)).
+  At 50 repositories polling once a minute that is 3,000 requests an hour before any page fetches,
+  so the default interval for large installs must be two minutes, not one.
+- **Pacing:** GitHub asks integrations to avoid concurrent requests and to pause at least one second
+  between mutating requests to stay clear of secondary limits
+  ([best practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)).
+  The outbox therefore runs one worker per provider with a one-second floor between writes and
+  jitter, not a four-way pool.
+- **Trap:** pull requests appear in the issues API and are identified by the `pull_request` key
+  ([issues endpoint](https://docs.github.com/en/rest/issues/issues)). Anything with that key must be
   filtered out, or the bridge creates a bug for every PR. Linked PRs are read separately, from the
   timeline, to derive `in_progress`.
 
 ### 13.2 Asana
 
-- **Auth:** a personal access token bound to a service account in the workspace for self-hosted
-  installs; OAuth for a future hosted mode. The token inherits the service account's access, so that
-  account should be a member of the project, not a workspace admin.
+- **Auth:** a personal access token from a dedicated bot user that is a guest or limited-access
+  member of the target project
+  ([authentication](https://developers.asana.com/docs/authentication),
+  [using bots](https://developers.asana.com/docs/using-bots.md)). Service accounts exist, but they
+  are an Enterprise feature and grant access to all data in the workspace, including private
+  projects, which is the opposite of least privilege for a bridge that needs one project.
 - **Read:** the events API, `GET /events?resource=<project_gid>&sync_token=<token>`, with
-  `opt_fields` set to the fields the sync uses. Events bubble up from tasks, subtasks and stories to
-  the project, so one subscription on the project covers everything inside it. Change events carry
-  `change.field`, `change.action` and the new or removed value; `event.action` (added, changed,
-  removed, deleted, undeleted) is different from `change.action` and both matter.
+  `opt_fields` set to the fields the sync uses. A subscription on a project includes changes to its
+  tasks, subtasks and stories, because events bubble up
+  ([events](https://developers.asana.com/docs/events)). `event.action` (added, changed, removed,
+  deleted, undeleted) is distinct from `change.action`, and both matter.
 - **Initial sync:** a request with no sync token returns **412 Precondition Failed**. The response
-  carries an initial sync token in `next_page.sync`. Store it and continue from there.
-- **Token lifetime:** sync tokens expire after 24 hours and may expire sooner under load. A 412 at
-  any point means re-crawl the project and start a new token. This is why the reconciler is not
-  optional and why a nightly full pass exists.
-- **Delivery guarantee:** at most once. Events can be missing, and are retained for 24 hours only.
-  The reconciler covers both cases.
+  carries an initial sync token in `next_page.sync`
+  ([events](https://developers.asana.com/docs/events)).
+- **Token lifetime:** sync tokens expire after 24 hours, and may expire sooner under load. A 412 at
+  any point means re-crawl the project and start a new token
+  ([events](https://developers.asana.com/docs/events)).
+- **Delivery guarantee:** at most once, with a 24-hour retention window
+  ([events](https://developers.asana.com/docs/events)). Events can be missing, which is why the
+  reconciler and the nightly sweep exist.
 - **Write:** create task, update task, set custom fields, move section, add story. Stories carry the
   origin marker.
 - **Webhooks (optional, v0.2):** the handshake arrives as a POST carrying `X-Hook-Secret` while the
-  create request is still open. Echo the header and answer 200 or 204 synchronously, or the
-  subscription is never created. Store the secret and verify `X-Hook-Signature` (SHA-256 HMAC of the
-  raw body) on every delivery. Answer within ten seconds; failures are retried for up to 24 hours,
-  after which the webhook is deleted. Empty `{"events": []}` heartbeats prove liveness, and
-  `failure_deletion_timestamp` on the subscription is the early warning that it is about to die.
-- **Rate limit:** 150 requests per minute on free domains, 1,500 on paid; search is capped lower, at
-  60 per minute. Concurrent calls are capped too, at 50 GETs and 15 writes in flight, and those
-  limits are counted separately. A 429 carries `Retry-After` and still consumes quota, so retrying
-  early makes the next window worse. The events API is documented as cheaper than resource reads.
-  Batch reads and cache project and custom-field metadata rather than walking the workspace.
+  create request is still open; echo the header and answer 200 or 204 synchronously or the
+  subscription is never created. Verify `X-Hook-Signature`, a SHA-256 HMAC of the raw body, on every
+  delivery. Answer within ten seconds; failures are retried for up to 24 hours, after which the
+  webhook is deleted. Heartbeats arrive every eight hours, and a webhook that goes unanswered for 24
+  hours is deleted
+  ([webhooks](https://developers.asana.com/docs/webhooks-guide)). Treat a missing heartbeat as a
+  liveness failure and recreate the subscription.
+- **Rate limit:** 150 requests per minute on free domains, 1,500 on paid; search is capped at 60 per
+  minute; concurrency is capped at 50 GETs and 15 writes in flight, counted separately. A 429
+  carries `Retry-After` and still consumes quota, so retrying early makes the next window worse
+  ([rate limits](https://developers.asana.com/docs/rate-limits)).
+- **Unknown:** whether a custom-field change reports the custom field's gid in `change.field` or a
+  generic name. The events documentation says only "the name of the field that has changed"
+  ([events](https://developers.asana.com/docs/events)), and the design depends on knowing which
+  custom field moved. This is the first thing to test, not assume.
 
 ### 13.3 Slack
 
-- **Auth:** a bot token with `chat:write`, `channels:read`, `users:read`. Socket Mode additionally
-  needs an app-level token with `connections:write`.
-- **Socket Mode (default):** an outbound WebSocket, no public URL and no request signing. This is the
-  default because a self-hosted install usually cannot accept inbound traffic.
-- **Events API (optional):** verify `X-Slack-Signature` as v0 over `v0:{timestamp}:{body}`, reject
-  timestamps older than five minutes, answer `url_verification` with the challenge, and deduplicate
-  on `event_id`. Retries carry `X-Slack-Retry-Num`; acknowledge before doing the work.
-- **Writes:** one message per bug, edited on state change, with comments as thread replies. A new
-  message per transition is the fastest way to get the bot muted.
-- **Rate limit:** about one message per second per channel. Queue per channel with jitter.
+- **Auth:** a bot token with `chat:write`, `channels:read`, `users:read` and `users:read.email`.
+  Socket Mode additionally needs an app-level token with `connections:write`.
+- **Socket Mode (default):** an outbound WebSocket with no public URL, built for apps behind a
+  firewall. The WebSocket URL is not static; it is created at runtime by calling
+  `apps.connections.open` and refreshed regularly, so the client must reconnect rather than cache it
+  ([Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode)).
+- **Events API (optional):** verify `X-Slack-Signature`, an HMAC SHA-256 over `v0:{timestamp}:{body}`
+  with the signing secret, and reject timestamps more than five minutes old
+  ([verifying requests](https://docs.slack.dev/authentication/verifying-requests-from-slack)).
+  Answer `url_verification` with the challenge and deduplicate on `event_id`.
+- **Writes:** one message per bug, edited on state change, with comments as thread replies. Attach
+  message [metadata](https://docs.slack.dev/messaging/message-metadata/) with the bug id so other
+  apps can correlate without parsing text. Slack documents roughly one message per second per
+  channel, plus a workspace-wide limit
+  ([rate limits](https://docs.slack.dev/apis/web-api/rate-limits)).
+- **Trap:** an app using Socket Mode cannot be listed in the public Slack Marketplace
+  ([Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode)). That is fine for a
+  self-hosted deployment and rules out distribution as a marketplace app.
 
 ## 14. Web dashboard
 
 The dashboard is not the primary interface. People keep working in GitHub and Asana. It is the only
-place where the whole picture exists at once, and it has to be good enough for the two jobs that
-have no home in either provider: finding a bug across repositories you do not all have open, and
-dispositioning one without opening a second tab.
+place where the whole picture exists at once, and it covers the two jobs that have no home in either
+provider: finding a bug across repositories you do not all have open, and dispositioning one without
+opening a second tab.
 
 It ships in v0.1 because a bridge whose behaviour cannot be inspected will not be trusted.
 
@@ -595,10 +683,10 @@ The interface has to be honest about that. Every editable field shows its owner 
 changed. Editing a field owned elsewhere opens a dialog that says so and offers either a conflict
 note or an explicit ownership takeover, which is audited.
 
-An edit to a field owned by Asana is sent to Asana with the service account, not written straight
-into the canonical record. The canonical value then changes when Asana's event comes back through
-the normal path. That keeps one write path, keeps Asana's own history correct, and means the
-dashboard cannot produce state that the providers disagree with.
+An edit to a field owned by Asana is sent to Asana with the bot token, not written straight into the
+canonical record. The canonical value then changes when Asana's event comes back through the normal
+path. That keeps one write path, keeps Asana's own history correct, and means the dashboard cannot
+produce state the providers disagree with.
 
 A dashboard that wrote the database directly would become a fourth system to reconcile.
 
@@ -634,27 +722,30 @@ back.
 
 ### 14.3 Access control
 
-Login is GitHub OAuth, because access at the first deployment is granted per person. A team-based model would be
-wrong about who can see what, and being wrong in the direction of showing someone a repository they
-cannot open defeats the purpose.
+Login is GitHub OAuth, because access at the first deployment is granted per person. A team-based
+model would be wrong about who can see what, and being wrong in the direction of showing someone a
+repository they cannot open defeats the purpose.
 
-The service is a GitHub App with user authorisation enabled. The flow uses `state` and PKCE; the
-callback exchanges the code at `/login/oauth/access_token`. The resulting user token is exchanged
-for `GET /user/installations/{installation_id}/repositories`, which returns exactly the repositories
-that user may see through this installation. A bug is visible when its `repo` is in that set.
+The service is a GitHub App with user authorisation enabled. The flow uses `state` and PKCE, and the
+callback exchanges the code for a user token
+([user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app)).
+The token is then used against `GET /user/installations/{installation_id}/repositories`, which
+returns exactly the repositories that person may reach through this installation. A bug is visible
+when its `repo` is in that set.
 
-Two consequences follow, and both belong in the README rather than in an operations note:
+Two consequences belong in the README rather than in an operations note:
 
-- **The App must be installed on every repository whose bugs should appear.** Access is the
-  intersection of what the app was granted and what the user can see. A repository the app was not
-  installed on has no dashboard presence for anyone.
+- **The App must be installed on every repository whose bugs should appear.** A user token can only
+  reach the intersection of what the app was granted and what the user can see
+  ([user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app)).
+  A repository the app was not installed on has no dashboard presence for anyone.
 - **User tokens expire after eight hours by default.** The design requests the `offline_access`
   scope so a refresh token is issued, stores it server-side alongside the session, and refreshes
   silently. Without that configuration a session dies mid-afternoon and users blame the tool.
 
 Repository lists are cached per session for ten minutes and re-checked before any write. A 401 or
-403 from the user token invalidates the cache immediately and downgrades the session, which is
-correct behaviour when someone is removed from a repository: the next request shows them fewer bugs.
+403 from the user token invalidates the cache immediately and downgrades the session, which is the
+correct behaviour when someone is removed from a repository.
 
 **Repo-less bugs** have no GitHub grant to consult. One setting decides: `ui.repo_less_visibility`
 with values `everyone`, `triagers` or `admins`, defaulting to `everyone` because those bugs are the
@@ -663,7 +754,7 @@ to `triagers`.
 
 **Roles** are configuration lists, not group claims: `admins: [logins]` and `triagers: [logins]`.
 Everyone else is a viewer, who can read and comment. Triagers create, assign, set severity and
-dispose. Admins additionally change rules, connectors, people and field ownership. A local
+dispose. Admins additionally manage rules, connectors, people and field ownership. A local
 break-glass admin exists for first boot and is disabled once a GitHub admin has logged in.
 
 **Sessions.** The user token and refresh token live in the server-side session record, keyed by an
@@ -676,9 +767,11 @@ cookie, and the OAuth callback validates `state` before exchanging the code.
 
 ### 14.4 Search
 
-SQLite uses an FTS5 table over title, description and comment text, maintained by triggers, ranked
-with `bm25()`. Postgres uses a generated `tsvector` column with a GIN index and `websearch_to_tsquery`.
-Both sit behind one `Search(query, filters, page)` interface, so the dashboard, the API and MCP share
+SQLite uses an [FTS5](https://www.sqlite.org/fts5.html) virtual table over title, description and
+comment text, maintained by triggers, ranked with `bm25()`. Postgres uses a generated `tsvector`
+column with a GIN index and
+[`websearch_to_tsquery`](https://www.postgresql.org/docs/current/textsearch-controls.html). Both sit
+behind one `Search(query, filters, page)` interface, so the dashboard, the API and MCP share
 behaviour and tests. `fishplate search reindex` rebuilds while serving.
 
 ### 14.5 Implementation
@@ -711,9 +804,9 @@ implementation instead of three.
 | GET | `/people` | mapping and unmapped |
 | GET | `/audit` | audit search |
 
-Pagination is cursor-based with a maximum page size of 100. Errors use RFC 9457
-`application/problem+json`. Breaking changes get a new path version; the old one stays for one minor
-release.
+Pagination is cursor-based with a maximum page size of 100. Errors use
+[RFC 9457](https://www.rfc-editor.org/rfc/rfc9457.html) `application/problem+json`. Breaking changes
+get a new path version; the old one stays for one minor release.
 
 ### 14.7 Degradation
 
@@ -724,25 +817,35 @@ yesterday's state as current is worse than no dashboard.
 
 ## 15. MCP server
 
-Target the **2026-07-28** protocol revision. It is stateless: there is no `initialize` handshake, no
-`Mcp-Session-Id`, and no protocol-level sessions. Every request declares its protocol version and
-client capabilities in `_meta` (`io.modelcontextprotocol/protocolVersion` and
+Target the **2026-07-28** revision, whose
+[changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog) removes the
+`initialize` handshake and protocol-level sessions. Every request declares its protocol version and
+client capabilities in `_meta` (`io.modelcontextprotocol/protocolVersion`,
 `io.modelcontextprotocol/clientCapabilities`), and the server accepts or rejects each request
-independently. A client that wants to negotiate up front calls `server/discover`, which the server
-must implement.
+independently ([versioning](https://modelcontextprotocol.io/specification/versioning)).
 
-Requirements that follow from that revision:
+Requirements that follow from that revision, all documented in the
+[Streamable HTTP binding](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http):
 
-- Every result carries `resultType`, `complete` or `input_required`.
-- `tools/list`, `resources/list` and reads carry `ttlMs` and `cacheScope`.
-- Streamable HTTP POSTs carry `Mcp-Method` and `Mcp-Name` headers, and the transport validates
-  `Origin` against an allowlist to prevent DNS rebinding.
+- Every POST carries `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name`, and the version header
+  must match the value in `_meta`. A request missing a required header is rejected.
+- Servers MUST validate `Origin` on incoming connections to prevent DNS rebinding, and reject an
+  invalid one.
+- Every result carries `resultType`, either `complete` or `input_required`.
+- `tools/list`, `resources/list` and reads carry `ttlMs` and `cacheScope`
+  ([caching](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching)). A
+  cacheable result is keyed by method plus the parameters that change it, and `cacheScope: private`
+  forbids sharing it across authorization contexts.
 - `tools/list` returns a deterministic order, so client caching and prompt caches stay useful.
-- Change notifications use `subscriptions/listen`; SSE resumability and `Last-Event-ID` are gone, so
-  a broken stream means reissuing the request.
+- Change notifications use a single long-lived `subscriptions/listen` stream. Resumable SSE with
+  `Last-Event-ID` is gone, so a broken stream means reissuing the request.
+- `server/discover` is implemented even though clients may skip it
+  ([discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)); it is the
+  only way a client learns the supported versions in one call.
 - Roots, sampling and logging are deprecated in this revision. New code should not use them.
 
-Transports: `stdio` for a local agent, Streamable HTTP at `/mcp` when enabled.
+Transports: `stdio` for a local agent, Streamable HTTP at `/mcp` when enabled. On stdio the server
+writes nothing to stdout except protocol messages, and logs go to stderr.
 
 ### Tools, v0.1 (read-only)
 
@@ -774,17 +877,22 @@ the active configuration with secrets removed.
 | Failure | Behaviour |
 |---|---|
 | Provider 5xx on write | Outbox backoff at 10s, 30s, 2m, 10m, 1h, 6h; dead-letter after eight attempts and alert. |
-| Rate limited | Honour `Retry-After`; per-connector token bucket sized to the plan in use. |
+| Rate limited | Honour `Retry-After`; per-connector token bucket sized to the plan in use. For Asana, a 429 still spends quota, so back off harder than the header suggests. |
 | Process dies after write, before recording | Read the external object; if it matches the intended write, mark done; otherwise retry. |
-| Missed event or webhook | Reconciler re-reads open bugs every 15 minutes; nightly full crawl covers Asana's 24-hour event window. |
+| Missed event or webhook | Reconciliation pass on a request budget; nightly full sweep covers Asana's 24-hour event window. |
 | Out-of-order delivery | Per-bug ordering by `occurred_at`, five-minute hold window, re-evaluation against current version. |
 | Duplicate delivery | Unique index on `(system, delivery_id)`; duplicates return 200 with no work. |
 | Provider schema change | Contract tests against recorded payloads fail the build before production sees it. |
-| Database lost | `fishplate rebuild --from github --from asana` reconstructs links and state from provider objects and markers. |
+| Database lost | `fishplate rebuild --from github --from asana` reconstructs links from the back-references in section 13. |
 | Sessions lost | Users log in again. Nothing durable lives in a session. |
 
-The rebuild path is worth building early. If links can be rebuilt from the providers, an operator
-will run the command instead of restoring an old backup and losing a day of changes.
+**Reconciliation budget.** Ten thousand bugs re-read every fifteen minutes would need about 667
+requests a minute, more than four times Asana's 150-per-minute free limit. The reconciler therefore
+works to a budget: at most 60 Asana requests a minute and 120 GitHub requests a minute, oldest
+`last_seen_at` first, cycling continuously. A full Asana sweep of 10,000 bugs at 60 a minute takes
+under three hours, which is fine overnight and too slow for the fifteen-minute figure the earlier
+draft claimed. Latency on the fast path comes from the events API and from incremental polling, not
+from the reconciler.
 
 ## 17. Security
 
@@ -793,7 +901,7 @@ will run the command instead of restoring an old backup and losing a day of chan
 | Secrets | Environment or mounted file only. Never in the image, the repository or the rules file. |
 | Webhook authenticity | Signature over raw bytes before parsing, constant-time comparison, timestamp window where the provider supplies one. |
 | Replay | Delivery ids are unique across all time for webhooks; the events table is the replay defence. |
-| Least privilege | GitHub App on named repos with three permissions; Asana service account limited to one project; Slack bot in two channels. |
+| Least privilege | GitHub App on named repos with three permissions; an Asana bot user limited to one project; a Slack bot in two channels. |
 | SSRF | Outbound hosts are an allowlist of the three provider APIs. No user-supplied URL is fetched. |
 | Dashboard sessions | HttpOnly, Secure, SameSite=Lax cookie; server-side token storage; OAuth `state` and PKCE. |
 | CSRF | Per-session token on every state-changing form and API call from the browser. |
@@ -803,8 +911,8 @@ will run the command instead of restoring an old backup and losing a day of chan
 | Public repository | Fixtures and demo configuration only. CI fails on a configured denylist of real names, domains and ids. |
 
 The threat model that matters most is not an outside attacker. It is a misconfigured rule that
-rewrites a thousand bugs, and the defence is the audit table, the dry-run mode on rule changes and
-the outbox preview in the dashboard.
+rewrites a thousand bugs, and the defence is the audit table, a dry-run mode on rule changes and the
+outbox preview in the dashboard.
 
 ## 18. Operations
 
@@ -824,11 +932,11 @@ names. Restore is documented and tested by opening the copy with `PRAGMA integri
 refuses to start if the schema is newer than the binary.
 
 **Deployment.** Distroless image, multi-arch, non-root, read-only root filesystem, one binary and one
-config file. On a single-node cluster the local-path provisioner typically budgets 32 GB per
-volume; this database is megabytes, but the limit is written down so nobody is surprised.
+config file. On a single-node cluster the local-path provisioner typically budgets 32 GB per volume;
+this database is megabytes, but the limit is written down so nobody is surprised.
 
 No ingress is required for the reference deployment: Socket Mode for Slack, events API for Asana,
-ETag polling for GitHub. That is what lets it start on a single node without waiting for a
+conditional polling for GitHub. That is what lets it start on a single node without waiting for a
 certificate or a port forward.
 
 **Health.** `/healthz` for the process, `/readyz` for database writability and connector
@@ -846,6 +954,7 @@ Metrics:
 - `fishplate_provider_errors_total{provider,code}`.
 - `fishplate_reconcile_drift_total` by system, counting values the reconciler had to repair.
 - `fishplate_loop_suppressed_total` by system.
+- `fishplate_ratelimit_remaining{provider}`.
 - `fishplate_search_duration_seconds`.
 - `fishplate_dashboard_actions_total{action,role}`.
 
@@ -856,7 +965,8 @@ sure the counter moves.
 Logs are JSON with `bug_id`, `source` and `delivery_id` on every line. Traces are optional at v0.1.
 
 Suggested alerts: outbox lag above five minutes for fifteen minutes; any dead-letter row; reconcile
-drift above ten per hour; a connector with no successful poll in three intervals.
+drift above ten per hour; a connector with no successful poll in three intervals; rate-limit
+remaining under 20% for an hour.
 
 ## 20. Testing
 
@@ -871,8 +981,10 @@ drift above ten per hour; a connector with no successful poll in three intervals
   exactly once. A bridge that cannot pass this is not releasable.
 - **Crash test:** kill the process between the provider write and the outbox update, then restart and
   assert the object is not duplicated.
+- **Rate test:** run the pollers against a token bucket that mirrors Asana's 150-per-minute and 15
+  concurrent writes, and assert no 429 storm and no dead letters.
 - **Load:** the section 4 targets at five times the stated rate, for an hour.
-- **Restore test:** back up, delete, restore, verify counts and that the next poll applies cleanly.
+- **Restore test:** back up, delete, restore, verify counts, and confirm the next poll applies cleanly.
 
 ## 21. Repository layout
 
@@ -954,8 +1066,8 @@ an account on any provider.
 ## 24. Risks
 
 1. **Identity mapping rots.** People leave, handles change, shared mailboxes are reassigned.
-   Mitigation: numeric ids, an explicit unmapped state, a safe `people sync` command and a dashboard
-   view that makes the backlog visible.
+   Mitigation: numeric ids, an explicit unmapped state, capture of verified addresses at login, and a
+   dashboard view that makes the backlog visible.
 2. **A loop guard fails in production.** Users see a fix reverted or a ticket reopened by the bridge
    and stop trusting it, and trust does not come back quickly. Mitigation: the echo test is a release
    gate, applied hashes are stored per projection, and suppressed events are visible in the UI.
@@ -969,19 +1081,63 @@ an account on any provider.
 
 ## 25. Prove these before building
 
-Four assumptions carry weight. Each can be tested with an afternoon and a scratch token.
+Five assumptions carry weight. Each can be tested with an afternoon and a scratch token.
 
-1. **Asana's events API reports the changes the sync cares about.** In particular, a custom-field
-   change must appear as a `changed` event with `change.field` set to the field, and the initial
-   412 must return a usable sync token. If custom fields do not surface, the severity and repo
-   mappings need a different source.
-2. **GitHub's conditional requests are free.** A 304 must not consume the 5,000-per-hour budget,
-   because minute polling across many repositories depends on it. Measure with a real token and read
-   the `x-ratelimit-remaining` header.
+1. **Asana reports custom-field changes in a usable shape.** A custom-field change must appear as a
+   `changed` event whose `change.field` identifies the field, and the initial 412 must return a
+   usable sync token. The documentation describes `change.field` only as "the name of the field"
+   ([events](https://developers.asana.com/docs/events)), so this is measured, not assumed. If custom
+   fields do not surface, severity and repo mapping need a different source.
+2. **GitHub's conditional requests are free and the budget fits.** A 304 must not consume the
+   5,000-per-hour floor, and fifty repositories polling every minute must stay inside it once page
+   fetches and writes are counted. Measure `x-ratelimit-remaining` across a day.
 3. **The origin marker survives both providers.** Comment and story rendering must return the marker
-   intact on read, or the first loop guard is decoration and only the applied hash is load-bearing.
+   intact on read, and Slack must return message metadata unmodified. If either strips it, only the
+   applied hash is load-bearing.
 4. **A user-to-server token returns the right repository list.** Compare
    `GET /user/installations/{id}/repositories` against what a second account actually sees in
    GitHub, including a repository reached through a direct collaborator grant and one reached through
-   a team. Per-person access is exactly the case a team model gets wrong, so this is measured with
-   two accounts before the dashboard is built.
+   a team. Per-person access is exactly the case a team model gets wrong.
+5. **A bot user in Asana can do the job.** Confirm that a guest or limited-access bot user can move
+   tasks between sections, set the custom fields the design uses, and post stories in the target
+   project, without the org-wide reach of an Enterprise service account.
+
+---
+
+## References
+
+Provider documentation, all fetched 2026-11-12:
+
+**GitHub**
+- [Managing visibility of your projects](https://docs.github.com/en/issues/planning-and-tracking-with-projects/managing-your-project/managing-visibility-of-your-projects): project items follow repository permissions.
+- [REST API endpoints for issues](https://docs.github.com/en/rest/issues/issues): `since`, `state_reason`, pull requests in issue responses.
+- [Rate limits for the REST API](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api): installation token floor, scaling, cap.
+- [Best practices for using the REST API](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api): conditional requests, pacing, avoiding concurrency.
+- [Generating a user access token for a GitHub App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app): OAuth flow, PKCE, `offline_access`, eight-hour tokens, repository intersection.
+- [Permissions required for GitHub Apps](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps): permission names and `GET /user/emails`.
+- [Validating webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries): `X-Hub-Signature-256`.
+
+**Asana**
+- [Events](https://developers.asana.com/docs/events): sync tokens, 412, 24-hour expiry, at-most-once delivery, bubbling.
+- [Webhooks](https://developers.asana.com/docs/webhooks-guide): handshake, signature, ten-second window, eight-hour heartbeats, deletion.
+- [Rate limits](https://developers.asana.com/docs/rate-limits): per-minute quotas, concurrency, search cap.
+- [Authentication](https://developers.asana.com/docs/authentication): PATs, service accounts, attribution.
+- [Using bots](https://developers.asana.com/docs/using-bots.md): bot accounts and scope restriction.
+
+**Slack**
+- [Rate limits](https://docs.slack.dev/apis/web-api/rate-limits): one message per second per channel.
+- [Using Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode): outbound WebSocket, `apps.connections.open`, Marketplace restriction.
+- [Verifying requests from Slack](https://docs.slack.dev/authentication/verifying-requests-from-slack): signing secret, five-minute window.
+- [Using message metadata](https://docs.slack.dev/messaging/message-metadata/): `metadata` parameter and `source.ref_id`.
+
+**Model Context Protocol**
+- [Specification 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog): stateless revision, sessions removed.
+- [Versioning](https://modelcontextprotocol.io/specification/versioning): per-request version negotiation.
+- [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http): required headers, `Origin` validation, no resumable SSE.
+- [Discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover): `server/discover`.
+- [Caching](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching): `ttlMs`, `cacheScope`.
+
+**Other**
+- [SQLite FTS5](https://www.sqlite.org/fts5.html): full-text search virtual table.
+- [PostgreSQL text search controls](https://www.postgresql.org/docs/current/textsearch-controls.html): `to_tsvector`, `tsquery`.
+- [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457.html): Problem Details for HTTP APIs.
