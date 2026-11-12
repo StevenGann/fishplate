@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/logo.svg" width="80" alt=""></p>
+<p align="center"><img src="docs/logo.svg" width="96" alt=""></p>
 <h1 align="center">Fishplate</h1>
 <p align="center"><strong>One canonical bug record across Asana, GitHub and Slack.</strong></p>
 
