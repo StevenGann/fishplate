@@ -1,0 +1,14 @@
+# Only the Go sources are needed in the build context. Version information is
+# passed with --build-arg, so .git stays out.
+.git
+.github
+.scratch
+bin
+deploy
+docs
+*.md
+Dockerfile
+.dockerignore
+*.db
+*.db-wal
+*.db-shm
