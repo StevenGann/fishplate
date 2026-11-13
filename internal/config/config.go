@@ -46,8 +46,8 @@ type Log struct {
 	Format string `yaml:"format"`
 }
 
-// DB configures the store. Phase 0a does not open the database; the path is
-// resolved and validated so that it appears in the effective configuration.
+// DB configures the store. The directory must already exist (it is the
+// mounted volume); the file is created on first start.
 type DB struct {
 	Path string `yaml:"path"`
 }

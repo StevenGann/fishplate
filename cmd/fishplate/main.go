@@ -17,6 +17,7 @@ import (
 
 	"github.com/StevenGann/fishplate/internal/config"
 	"github.com/StevenGann/fishplate/internal/logging"
+	"github.com/StevenGann/fishplate/internal/store"
 	"github.com/StevenGann/fishplate/internal/version"
 	"github.com/StevenGann/fishplate/internal/web"
 )
@@ -25,7 +26,8 @@ const usage = `usage: fishplate <command> [flags]
 
 commands:
   version                       print build information
-  serve [flags]                 run the HTTP server
+  serve [flags]                 apply pending migrations, then run the HTTP server
+  migrate [--dry-run] [flags]   apply pending database migrations, or list them
   config show --effective [flags]
                                 print the resolved configuration, secrets redacted
 
@@ -78,6 +80,8 @@ func run(ctx context.Context, args []string, e env) int {
 		return exitOK
 	case "serve":
 		return cmdServe(ctx, args[1:], e)
+	case "migrate":
+		return cmdMigrate(ctx, args[1:], e)
 	case "config":
 		return cmdConfig(args[1:], e)
 	case "help", "-h", "--help":
@@ -140,6 +144,47 @@ func cmdConfig(args []string, e env) int {
 	return exitOK
 }
 
+func cmdMigrate(ctx context.Context, args []string, e env) int {
+	var dryRun bool
+	cfg, _, code, ok := parseConfig("migrate", args, e, func(fs *flag.FlagSet) {
+		fs.BoolVar(&dryRun, "dry-run", false, "report pending migrations without changing the database")
+	})
+	if !ok {
+		return code
+	}
+	if dryRun {
+		p, err := store.DryRun(ctx, cfg.DB.Path)
+		if err != nil {
+			fmt.Fprintf(e.stderr, "migrate --dry-run: %v\n", err)
+			return exitError
+		}
+		if !p.Exists {
+			fmt.Fprintf(e.stdout, "database %s does not exist; it would be created\n", cfg.DB.Path)
+		}
+		fmt.Fprintf(e.stdout, "schema version %d, binary version %d, %d pending\n", p.Current, p.Latest, len(p.Pending))
+		for _, m := range p.Pending {
+			fmt.Fprintf(e.stdout, "would apply %s\n", m.Name)
+		}
+		return exitOK
+	}
+	st, err := store.Open(ctx, cfg.DB.Path, store.Options{})
+	if err != nil {
+		fmt.Fprintf(e.stderr, "migrate: %v\n", err)
+		return exitError
+	}
+	defer st.Close()
+	res, err := st.Migrate(ctx)
+	if err != nil {
+		fmt.Fprintf(e.stderr, "migrate: %v\n", err)
+		return exitError
+	}
+	for _, m := range res.Applied {
+		fmt.Fprintf(e.stdout, "applied %s\n", m.Name)
+	}
+	fmt.Fprintf(e.stdout, "schema version %d (was %d), %d applied\n", res.To, res.From, len(res.Applied))
+	return exitOK
+}
+
 func cmdServe(ctx context.Context, args []string, e env) int {
 	cfg, src, code, ok := parseConfig("serve", args, e, nil)
 	if !ok {
@@ -158,7 +203,27 @@ func cmdServe(ctx context.Context, args []string, e env) int {
 }
 
 func serve(ctx context.Context, cfg config.Config, src config.Source, logger *slog.Logger, e env) error {
-	srv := web.New(logger, web.NewMetrics(version.Version, version.Commit))
+	logger.Info("starting",
+		"version", version.Version, "commit", version.Commit, "date", version.Date,
+		"config_file", src.Path, "config_file_loaded", src.Loaded,
+		"log_level", cfg.Log.Level, "db_path", cfg.DB.Path)
+
+	// The database comes first: a process that cannot open or migrate it
+	// refuses to start rather than serve without a store.
+	st, err := store.Open(ctx, cfg.DB.Path, store.Options{})
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	res, err := st.Migrate(ctx)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	logger.Info("schema ready", "db_path", st.Path(), "from_version", res.From, "to_version", res.To,
+		"applied", len(res.Applied))
+
+	srv := web.New(logger, web.NewMetrics(version.Version, version.Commit),
+		web.WithReadinessCheck(st.CheckWritable))
 
 	ln, err := e.listen("tcp", cfg.HTTP.Addr)
 	if err != nil {
@@ -174,10 +239,7 @@ func serve(ctx context.Context, cfg config.Config, src config.Source, logger *sl
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
 
-	logger.Info("starting",
-		"version", version.Version, "commit", version.Commit, "date", version.Date,
-		"addr", ln.Addr().String(), "config_file", src.Path, "config_file_loaded", src.Loaded,
-		"log_level", cfg.Log.Level)
+	logger.Info("listening", "addr", ln.Addr().String())
 
 	errc := make(chan error, 1)
 	go func() { errc <- hs.Serve(ln) }()

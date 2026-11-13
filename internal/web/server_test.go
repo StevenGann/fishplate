@@ -2,7 +2,9 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -80,6 +82,46 @@ func TestEndpoints(t *testing.T) {
 				t.Error("missing X-Request-Id")
 			}
 		})
+	}
+}
+
+func TestReadinessCheck(t *testing.T) {
+	var logs bytes.Buffer
+	var fail error
+	calls := 0
+	s := New(slog.New(slog.NewJSONHandler(&logs, nil)), NewMetrics("v", "c"),
+		WithReadinessCheck(func(ctx context.Context) error {
+			calls++
+			if _, ok := ctx.Deadline(); !ok {
+				t.Error("readiness check called without a deadline")
+			}
+			return fail
+		}))
+	s.SetReady(true)
+
+	if rec := do(s.Handler(), "GET", "/readyz"); rec.Code != 200 {
+		t.Fatalf("healthy check: status %d", rec.Code)
+	}
+	fail = errors.New("attempt to write a readonly database")
+	rec := do(s.Handler(), "GET", "/readyz")
+	if rec.Code != 503 || !strings.HasPrefix(rec.Header().Get("Content-Type"), ProblemContentType) ||
+		!strings.Contains(rec.Body.String(), "readonly database") {
+		t.Fatalf("failing check: %d %s %s", rec.Code, rec.Header().Get("Content-Type"), rec.Body)
+	}
+	if !strings.Contains(logs.String(), "readiness check failed") {
+		t.Errorf("failure not logged: %s", logs.String())
+	}
+	fail = nil
+	if rec := do(s.Handler(), "GET", "/readyz"); rec.Code != 200 {
+		t.Fatalf("recovered check: status %d", rec.Code)
+	}
+	if calls != 3 {
+		t.Fatalf("check ran %d times, want once per request (3)", calls)
+	}
+
+	s.SetReady(false)
+	if rec := do(s.Handler(), "GET", "/readyz"); rec.Code != 503 || calls != 3 {
+		t.Fatalf("not serving: status %d, calls %d", rec.Code, calls)
 	}
 }
 

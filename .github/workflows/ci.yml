@@ -1,0 +1,102 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: vet, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go mod verify
+        run: go mod verify
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race detector)
+        run: go test -race -count=1 ./...
+
+      - name: concurrent open and migrate, repeated
+        run: go test -race -count=5 -run 'TestConcurrent|TestOpenStress' ./internal/store
+
+      - name: go build
+        env:
+          CGO_ENABLED: "0"
+        run: make build
+
+      - name: binary reports its version
+        run: ./bin/fishplate version
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: build metadata
+        id: meta
+        run: |
+          echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: docker build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: fishplate:ci
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ steps.meta.outputs.commit }}
+            DATE=${{ steps.meta.outputs.date }}
+
+      - name: image prints its version
+        run: docker run --rm fishplate:ci version | tee /dev/stderr | grep -F "${{ steps.meta.outputs.commit }}"
+
+      - name: image has no shell
+        run: |
+          if docker run --rm --entrypoint /bin/sh fishplate:ci -c true; then
+            echo "runtime image contains a shell" >&2
+            exit 1
+          fi
+
+      - name: serve becomes ready on a named volume as nonroot
+        run: |
+          docker volume create fishplate-ci-data
+          docker run -d --name fishplate-ci -v fishplate-ci-data:/data -p 8080:8080 fishplate:ci serve
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/readyz || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          docker logs fishplate-ci
+          test "$code" = "200"
+          test "$(docker inspect -f '{{.Config.User}}' fishplate-ci)" = "65532:65532"
+
+      - name: cleanup
+        if: always()
+        run: |
+          docker rm -f fishplate-ci || true
+          docker volume rm fishplate-ci-data || true

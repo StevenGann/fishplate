@@ -1,0 +1,46 @@
+# Local demo: one fishplate container with its database on a named volume.
+#
+#   docker compose -f deploy/compose/docker-compose.yml up --build
+#   curl -s localhost:8080/readyz
+#
+# On first use Docker seeds the empty named volume from the image's /data,
+# which the image creates owned by the nonroot user (65532), so the
+# database is writable without running as root.
+name: fishplate
+
+services:
+  fishplate:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${FISHPLATE_VERSION:-dev}
+        COMMIT: ${FISHPLATE_COMMIT:-unknown}
+        DATE: ${FISHPLATE_DATE:-unknown}
+    image: fishplate:dev
+    command: ["serve"]
+    user: "65532:65532"
+    read_only: true
+    # SQLite may spill temporary files for large sorts; the root filesystem
+    # is read-only, so give it a writable /tmp.
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      FISHPLATE_HTTP_ADDR: ":8080"
+      FISHPLATE_DB_PATH: /data/fishplate.db
+      FISHPLATE_LOG_LEVEL: info
+      # Secrets are supplied from the operator's environment, never written
+      # here. They are not used until the connectors land.
+      # FISHPLATE_SECRETS_ASANA_TOKEN: ${FISHPLATE_SECRETS_ASANA_TOKEN}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - fishplate-data:/data
+    restart: unless-stopped
+
+volumes:
+  fishplate-data:

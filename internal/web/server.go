@@ -1,14 +1,16 @@
-// Package web serves Fishplate's HTTP endpoints. Phase 0a exposes health,
-// readiness and metrics only.
+// Package web serves Fishplate's HTTP endpoints: health, readiness and
+// metrics.
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // Server holds the HTTP handler and the readiness state.
@@ -16,13 +18,30 @@ type Server struct {
 	logger  *slog.Logger
 	metrics *Metrics
 	ready   atomic.Bool
+	check   func(context.Context) error
 	handler http.Handler
+}
+
+// ReadyTimeout bounds one readiness check, so a probe gets an answer before
+// a typical kubelet probe timeout even when the database lock is held.
+const ReadyTimeout = 3 * time.Second
+
+// Option configures a Server.
+type Option func(*Server)
+
+// WithReadinessCheck makes /readyz run check on every request and answer 503
+// when it fails.
+func WithReadinessCheck(check func(context.Context) error) Option {
+	return func(s *Server) { s.check = check }
 }
 
 // New builds the handler tree. The server starts not ready; call SetReady
 // once the listener is accepting connections.
-func New(logger *slog.Logger, metrics *Metrics) *Server {
+func New(logger *slog.Logger, metrics *Metrics, opts ...Option) *Server {
 	s := &Server{logger: logger, metrics: metrics}
+	for _, o := range opts {
+		o(s)
+	}
 	mux := http.NewServeMux()
 	s.handle(mux, "/healthz", s.healthz, http.MethodGet, http.MethodHead)
 	s.handle(mux, "/readyz", s.readyz, http.MethodGet, http.MethodHead)
@@ -72,8 +91,10 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// readyz reports whether the process is serving. Phase 0a has no database or
-// connectors to check; 0b adds a real write to the store.
+// readyz reports whether the process should receive traffic: it must be
+// serving, and the readiness check (in 0b, a committed write to the store)
+// must succeed on this request. Nothing is cached; a database that becomes
+// unwritable turns the next probe into a 503.
 func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 	if !s.ready.Load() {
 		writeProblem(w, r, Problem{
@@ -81,6 +102,19 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 			Detail: "server is not accepting traffic",
 		})
 		return
+	}
+	if check := s.check; check != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), ReadyTimeout)
+		defer cancel()
+		if err := check(ctx); err != nil {
+			s.logger.WarnContext(r.Context(), "readiness check failed",
+				"request_id", requestIDFrom(r.Context()), "error", err)
+			writeProblem(w, r, Problem{
+				Status: http.StatusServiceUnavailable,
+				Detail: "database is not writable: " + err.Error(),
+			})
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
